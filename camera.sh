@@ -22,13 +22,151 @@ fi
 # Sleep que pode ser interrompido ao encerrar o script
 nap() { sleep "$1" & wait $! 2>/dev/null; }
 
+# ---------------------------------------------------------------------------
+# Privilégios mínimos
+#
+# Só o arp-scan precisa de root (ele abre sockets raw). A senha do sudo é
+# pedida UMA única vez, no início do script, e o cache de credenciais é
+# renovado em background enquanto o script estiver rodando. O ffplay, os
+# laços, os traps e todo o resto continuam rodando como usuário comum.
+#
+# Alternativas sem senha (opcional, uma vez só):
+#   sudo setcap cap_net_raw+p "$(command -v arp-scan || echo /usr/sbin/arp-scan)"
+#   ou uma regra NOPASSWD no sudoers apenas para o arp-scan.
+# ---------------------------------------------------------------------------
+
+# arp-scan pode estar fora do PATH (Debian: /usr/sbin, Arch: /usr/bin, etc.)
+find_arp_scan() {
+    local p
+    if p=$(command -v arp-scan 2>/dev/null) && [ -x "$p" ]; then
+        printf '%s' "$p"
+        return 0
+    fi
+    for p in /usr/sbin/arp-scan /usr/bin/arp-scan /sbin/arp-scan \
+             /usr/local/sbin/arp-scan /usr/local/bin/arp-scan; do
+        if [ -x "$p" ]; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ARP_SCAN_BIN="$(find_arp_scan || true)"
+SUDO_OK=0               # 1 = rodar o arp-scan através do sudo
+SUDO_KEEPALIVE_PID=""   # PID do processo que renova o cache do sudo
+
+# Existe um terminal para digitar a senha?
+have_tty() { { : </dev/tty; } 2>/dev/null; }
+
+# Pede a senha do sudo (só para o arp-scan) e mantém o cache válido
+init_privileges() {
+    # Sem arp-scan instalado: nada a fazer, o ip neigh resolve
+    [ -x "$ARP_SCAN_BIN" ] || { ARP_SCAN_BIN=""; return 0; }
+
+    # Já somos root: roda direto, sem sudo nem senha
+    if [ "$EUID" -eq 0 ]; then
+        SUDO_OK=0
+        return 0
+    fi
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "[$(date '+%T')] aviso: arp-scan precisa de root e o sudo não está instalado." >&2
+        echo "[$(date '+%T')] aviso: usando a tabela ARP do kernel (ip neigh) como alternativa." >&2
+        ARP_SCAN_BIN=""
+        return 0
+    fi
+
+    if sudo -n true 2>/dev/null; then
+        SUDO_OK=1                       # senha já em cache / NOPASSWD
+    else
+        if have_tty; then
+            echo "==> O arp-scan precisa de root. A senha do sudo é usada apenas por ele;" >&2
+            echo "    o restante do script continua rodando como o seu usuário." >&2
+        fi
+        if have_tty && sudo -v; then
+            SUDO_OK=1                   # pediu a senha uma única vez
+        else
+            echo "[$(date '+%T')] aviso: sem permissão para o arp-scan." >&2
+            echo "[$(date '+%T')] aviso: usando a tabela ARP do kernel (ip neigh) como alternativa." >&2
+            ARP_SCAN_BIN=""
+            return 0
+        fi
+    fi
+
+    # Renova a credencial do sudo a cada 60s para nunca pedir a senha de novo.
+    # (sem redirecionar stdout/stderr, para o sudo localizar o terminal)
+    (
+        while sleep 60; do
+            sudo -n -v 2>/dev/null || exit 0
+        done
+    ) &
+    SUDO_KEEPALIVE_PID=$!
+}
+
+# Varredura da rede com o privilégio já resolvido (só este comando usa root)
+run_arp_scan() {
+    local iface="$1" out=""
+    if [ "$SUDO_OK" -eq 1 ]; then
+        out=$(sudo -n "$ARP_SCAN_BIN" --plain --quiet \
+                  --interface="$iface" --localnet 2>/dev/null)
+        # Credencial do sudo expirou (só acontece se o keepalive morrer)
+        if [ -z "$out" ] && ! sudo -n -v 2>/dev/null; then
+            echo "[$(date '+%T')] aviso: a credencial do sudo expirou; reinicie o script para voltar a usar o arp-scan." >&2
+        fi
+    else
+        out=$("$ARP_SCAN_BIN" --plain --quiet \
+                  --interface="$iface" --localnet 2>/dev/null)
+    fi
+    printf '%s\n' "$out"
+}
+
+# Cache da varredura: as câmeras compartilham o mesmo resultado por SCAN_TTL
+# segundos, para não rodar arp-scan uma vez para cada câmera ao mesmo tempo
+SCAN_TTL=30
+SCAN_CACHE="${TMPDIR:-/tmp}/camera.sh.arp.${UID}"
+
+scan_network() {
+    local iface="$1" now ts out
+    (
+        exec 9>"${SCAN_CACHE}.lock"
+        command -v flock >/dev/null 2>&1 && flock -w 20 9
+
+        now=$(date +%s)
+        if [ -s "$SCAN_CACHE" ]; then
+            read -r ts < "$SCAN_CACHE"
+            if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$((now - ts))" -lt "$SCAN_TTL" ]; then
+                tail -n +2 "$SCAN_CACHE"
+                exit 0
+            fi
+        fi
+
+        out=$(run_arp_scan "$iface")
+        if [ -n "$out" ]; then
+            { printf '%s\n' "$now"; printf '%s\n' "$out"; } > "$SCAN_CACHE"
+        fi
+        printf '%s\n' "$out"
+    )
+}
+
 # Procura o IP pelo MAC (refeito a cada tentativa, caso o IP mude)
 find_ip() {
-    local iface
+    local mac="${1,,}" iface ip
     iface=$(ip route | awk '/default/ {print $5; exit}')
     [ -z "$iface" ] && return
-    sudo -n arp-scan -x --interface="$iface" --localnet 2>/dev/null \
-        | grep -i "$1" | awk '{print $1}' | head -n1
+
+    # 1) arp-scan (precisa de root, já resolvido em init_privileges)
+    if [ -n "$ARP_SCAN_BIN" ] && [ -x "$ARP_SCAN_BIN" ]; then
+        ip=$(scan_network "$iface" | awk -v mac="$mac" 'tolower($2) == mac {print $1; exit}')
+        if [ -n "$ip" ]; then
+            printf '%s\n' "$ip"
+            return
+        fi
+    fi
+
+    # 2) Tabela ARP do kernel (sem privilégio nenhum)
+    ip neigh 2>/dev/null | awk -v mac="$mac" \
+        'tolower($5) == mac && $6 !~ /FAILED|INCOMPLETE/ {print $1; exit}'
 }
 
 run_camera() {
@@ -58,8 +196,17 @@ run_camera() {
     done
 }
 
-# Ctrl+C encerra tudo
-trap 'kill $(jobs -p) 2>/dev/null; exit 0' INT TERM
+# Ctrl+C encerra tudo (inclusive o keepalive do sudo)
+shutdown() {
+    [ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null
+    kill $(jobs -p) 2>/dev/null
+    rm -f "${SCAN_CACHE:-/nonexistent}" "${SCAN_CACHE:-/nonexistent}.lock" 2>/dev/null
+    exit 0
+}
+trap shutdown INT TERM
+
+# Pede a senha do sudo uma única vez, apenas para viabilizar o arp-scan
+init_privileges
 
 for NAME in "${!CAMERAS[@]}"; do
     run_camera "$NAME" "${CAMERAS[$NAME]}" &
